@@ -1,0 +1,341 @@
+diff --git a/MyPyggpotMods.diff b/MyPyggpotMods.diff
+new file mode 100644
+index 0000000..e552984
+--- /dev/null
++++ b/MyPyggpotMods.diff
+@@ -0,0 +1,165 @@
++diff --git a/MyPyggpotMods.diff b/MyPyggpotMods.diff
++new file mode 100644
++index 0000000..72608c0
++--- /dev/null
+++++ b/MyPyggpotMods.diff
++@@ -0,0 +1,13 @@
+++diff --git a/proto/pot/service.proto b/proto/pot/service.proto
+++index ce31dfa..9fc8c01 100644
+++--- a/proto/pot/service.proto
++++++ b/proto/pot/service.proto
+++@@ -36,7 +36,7 @@ message CreatePotRequest {
+++     string pot_name = 1 [
+++         (validator.field) = {
+++             regex: "^[A-Za-z0-9]{2}(?:[ _-]?[A-Za-z0-9])+$"
+++-            human_error: "Can contain only alphanumeric characters, dot and underscore."
++++            human_error: "Can start with at least 2 alphanumeric characters following by blank space, underscore, dash or one or more alphanumeric characters."
+++         }
+++     ]; // required
+++     int32 max_coins = 2 [(validator.field) = {int_gt:5}];
++diff --git a/cmd/server/__debug_bin b/cmd/server/__debug_bin
++new file mode 100755
++index 0000000..1f46820
++Binary files /dev/null and b/cmd/server/__debug_bin differ
++diff --git a/internal/providers/coin/provider.go b/internal/providers/coin/provider.go
++index ebe9cf9..28c17a3 100644
++--- a/internal/providers/coin/provider.go
+++++ b/internal/providers/coin/provider.go
++@@ -4,11 +4,19 @@ import (
++ 	"context"
++ 	"database/sql"
++ 	"fmt"
+++	"math/rand"
+++	"time"
+++
++ 	"github.com/aspiration-labs/pyggpot/internal/models"
++-	"github.com/aspiration-labs/pyggpot/rpc/go/coin"
+++	coin_service "github.com/aspiration-labs/pyggpot/rpc/go/coin"
++ 	"github.com/twitchtv/twirp"
++ )
++ 
+++type ID int32
+++
+++func init() {
+++	rand.Seed(time.Now().UnixNano())
+++}
++ type coinServer struct{
++ 	DB *sql.DB
++ }
++@@ -50,6 +58,101 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
++ 	}, nil
++ }
++ 
++-func (s *coinServer) RemoveCoins(context.Context, *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
++-	panic("implement me")
+++func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
+++	tx, err := s.DB.Begin()
+++	if err != nil {
+++		return nil, twirp.InternalError(err.Error())
+++	}
+++
+++	coins, err := models.CoinsInPotsByPot_id(tx, int(request.PotId))
+++	if err != nil {
+++		return nil, twirp.NotFoundError(err.Error())
+++	}
+++
+++	coinsSlippedOut := s.getCoinsFromPot(coins, request.Count)
+++
+++	if len(coinsSlippedOut) == 0 {
+++		return nil, twirp.InvalidArgumentError("not enough coins in pot", "")
+++	}
+++
+++	var coinsTakenOut []*coin_service.Coins
+++
+++	coinsTakenOutByDenomination := make(map[int32]*coin_service.Coins)
+++
+++	for k, v := range coinsSlippedOut {
+++		coinToUpdate, err := models.CoinByID(tx, int32(k))
+++		if err != nil {
+++			return nil, twirp.NotFoundError(err.Error())
+++		}
+++
+++		coinToUpdate.CoinCount -= v
+++		err = coinToUpdate.Update(tx)
+++		if err != nil {
+++			return nil, twirp.NotFoundError(err.Error())
+++		}
+++
+++		coinTakenOut, ok := coinsTakenOutByDenomination[coinToUpdate.Denomination]
+++		if !ok {
+++			coinsTakenOutByDenomination[coinToUpdate.Denomination] = &coin_service.Coins{
+++				Kind: coin_service.Coins_Kind(coinToUpdate.Denomination),
+++				Count: v,
+++			}
+++			continue
+++		}
+++		coinTakenOut.Count += v
+++	}
+++	err = tx.Commit()
+++	if err != nil {
+++		return nil, twirp.NotFoundError(err.Error())
+++	}
+++
+++	for _, c := range coinsTakenOutByDenomination {
+++		coinsTakenOut = append(coinsTakenOut, c)
+++	}
+++
+++	return &coin_service.CoinsListResponse{
+++		Coins: coinsTakenOut,
+++	}, nil
+++}
+++
+++// generates returns an index where tha denomination is stored
+++func (s *coinServer) generateRandomIndex(totalCoinsByDenomination int) int {
+++	return rand.Intn(totalCoinsByDenomination)
+++}
+++
+++func remove(slice []*models.CoinsInPot, s int) []*models.CoinsInPot {
+++	return append(slice[:s], slice[s+1:]...)
++ }
+++
+++// Simulate shaking a piggy bank upside down, so gets coins that are in the pot
+++// the type (denomination) of the coin is random, based on the proportion of that coin type in the pot
+++// returns a map where the key is the id and the value represents how many coins of that denomination are taken
+++func (s *coinServer) getCoinsFromPot(coinsInPot []*models.CoinsInPot, count int32) map[ID]int32 {
+++	coinsInPotFiltered := make([]*models.CoinsInPot, 0, len(coinsInPot))
+++	var totalCoins int32
+++	for _, c := range coinsInPot {
+++		if c.CoinCount > 0 {
+++			totalCoins += c.CoinCount
+++			coinsInPotFiltered = append(coinsInPotFiltered, c)
+++		}
+++	}
+++	var counter int32
+++	coinsToRemove := make(map[ID]int32, 0)
+++	for counter < count && totalCoins >= count {
+++		counter++
+++		index := s.generateRandomIndex(len(coinsInPotFiltered))
+++		coin := coinsInPotFiltered[index]
+++		coin.CoinCount -= 1
+++		if coin.CoinCount == 0 {
+++			coinsInPotFiltered = remove(coinsInPotFiltered, index)
+++		}
+++		coinToRemove, ok := coinsToRemove[ID(coin.ID)]
+++		if ok {
+++			coinsToRemove[ID(coin.ID)] = coinToRemove + 1
+++			continue
+++		}
+++		coinsToRemove[ID(coin.ID)] = 1
+++	}
+++	return coinsToRemove
+++}
+++
++diff --git a/proto/pot/service.proto b/proto/pot/service.proto
++index ce31dfa..9fc8c01 100644
++--- a/proto/pot/service.proto
+++++ b/proto/pot/service.proto
++@@ -36,7 +36,7 @@ message CreatePotRequest {
++     string pot_name = 1 [
++         (validator.field) = {
++             regex: "^[A-Za-z0-9]{2}(?:[ _-]?[A-Za-z0-9])+$"
++-            human_error: "Can contain only alphanumeric characters, dot and underscore."
+++            human_error: "Can start with at least 2 alphanumeric characters following by blank space, underscore, dash or one or more alphanumeric characters."
++         }
++     ]; // required
++     int32 max_coins = 2 [(validator.field) = {int_gt:5}];
+diff --git a/README.md b/README.md
+index 0ee1c57..9f1e833 100644
+--- a/README.md
++++ b/README.md
+@@ -41,3 +41,19 @@ go run cmd/server/main.go
+ ## Play
+ 
+ Swagger site at [http://localhost:8080/swaggerui/](http://localhost:8080/swaggerui/)
++
++## TODO Document a better design to support the RemoveCoins service
++
++The current design is not scalable since information is duplicated which means that more work has to be done when running RemoveCoins.
++
++Currently we have a number of known or fixed denominations, however this should be flexible to change so we must have a scheme where the denominations and their value are stored, denomination schema.
++
++The provider must be implemented in order to insert the information into the new naming scheme.
++
++Another change that needs to be made is to have a registration per denomination tied to a pot. That is, in the coins table, a denomination must not be repeated several times (several records) for the same pot, so when we insert a coin for a pot, it must be verified if that denomination already exists for that pot it will be inserted otherwise the count for that denomination would be updated.
++
++When the records with the denominations reach 0, that is, there are no more coins in a pot of one denomination, those records must be deleted.
++
++You could have a query to fetch the currency records that are going to be used in an array so as not to consult them one by one, since due to the nature of the problem, a large amount of data will not be handled since the pots have a limit as well as the coins to be mined.
++
++Transactions should be used to deal with concurrency.
+diff --git a/cmd/server/__debug_bin b/cmd/server/__debug_bin
+new file mode 100755
+index 0000000..1f46820
+Binary files /dev/null and b/cmd/server/__debug_bin differ
+diff --git a/internal/providers/coin/provider.go b/internal/providers/coin/provider.go
+index ebe9cf9..28c17a3 100644
+--- a/internal/providers/coin/provider.go
++++ b/internal/providers/coin/provider.go
+@@ -4,11 +4,19 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
++	"math/rand"
++	"time"
++
+ 	"github.com/aspiration-labs/pyggpot/internal/models"
+-	"github.com/aspiration-labs/pyggpot/rpc/go/coin"
++	coin_service "github.com/aspiration-labs/pyggpot/rpc/go/coin"
+ 	"github.com/twitchtv/twirp"
+ )
+ 
++type ID int32
++
++func init() {
++	rand.Seed(time.Now().UnixNano())
++}
+ type coinServer struct{
+ 	DB *sql.DB
+ }
+@@ -50,6 +58,101 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
+ 	}, nil
+ }
+ 
+-func (s *coinServer) RemoveCoins(context.Context, *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
+-	panic("implement me")
++func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
++	tx, err := s.DB.Begin()
++	if err != nil {
++		return nil, twirp.InternalError(err.Error())
++	}
++
++	coins, err := models.CoinsInPotsByPot_id(tx, int(request.PotId))
++	if err != nil {
++		return nil, twirp.NotFoundError(err.Error())
++	}
++
++	coinsSlippedOut := s.getCoinsFromPot(coins, request.Count)
++
++	if len(coinsSlippedOut) == 0 {
++		return nil, twirp.InvalidArgumentError("not enough coins in pot", "")
++	}
++
++	var coinsTakenOut []*coin_service.Coins
++
++	coinsTakenOutByDenomination := make(map[int32]*coin_service.Coins)
++
++	for k, v := range coinsSlippedOut {
++		coinToUpdate, err := models.CoinByID(tx, int32(k))
++		if err != nil {
++			return nil, twirp.NotFoundError(err.Error())
++		}
++
++		coinToUpdate.CoinCount -= v
++		err = coinToUpdate.Update(tx)
++		if err != nil {
++			return nil, twirp.NotFoundError(err.Error())
++		}
++
++		coinTakenOut, ok := coinsTakenOutByDenomination[coinToUpdate.Denomination]
++		if !ok {
++			coinsTakenOutByDenomination[coinToUpdate.Denomination] = &coin_service.Coins{
++				Kind: coin_service.Coins_Kind(coinToUpdate.Denomination),
++				Count: v,
++			}
++			continue
++		}
++		coinTakenOut.Count += v
++	}
++	err = tx.Commit()
++	if err != nil {
++		return nil, twirp.NotFoundError(err.Error())
++	}
++
++	for _, c := range coinsTakenOutByDenomination {
++		coinsTakenOut = append(coinsTakenOut, c)
++	}
++
++	return &coin_service.CoinsListResponse{
++		Coins: coinsTakenOut,
++	}, nil
++}
++
++// generates returns an index where tha denomination is stored
++func (s *coinServer) generateRandomIndex(totalCoinsByDenomination int) int {
++	return rand.Intn(totalCoinsByDenomination)
++}
++
++func remove(slice []*models.CoinsInPot, s int) []*models.CoinsInPot {
++	return append(slice[:s], slice[s+1:]...)
+ }
++
++// Simulate shaking a piggy bank upside down, so gets coins that are in the pot
++// the type (denomination) of the coin is random, based on the proportion of that coin type in the pot
++// returns a map where the key is the id and the value represents how many coins of that denomination are taken
++func (s *coinServer) getCoinsFromPot(coinsInPot []*models.CoinsInPot, count int32) map[ID]int32 {
++	coinsInPotFiltered := make([]*models.CoinsInPot, 0, len(coinsInPot))
++	var totalCoins int32
++	for _, c := range coinsInPot {
++		if c.CoinCount > 0 {
++			totalCoins += c.CoinCount
++			coinsInPotFiltered = append(coinsInPotFiltered, c)
++		}
++	}
++	var counter int32
++	coinsToRemove := make(map[ID]int32, 0)
++	for counter < count && totalCoins >= count {
++		counter++
++		index := s.generateRandomIndex(len(coinsInPotFiltered))
++		coin := coinsInPotFiltered[index]
++		coin.CoinCount -= 1
++		if coin.CoinCount == 0 {
++			coinsInPotFiltered = remove(coinsInPotFiltered, index)
++		}
++		coinToRemove, ok := coinsToRemove[ID(coin.ID)]
++		if ok {
++			coinsToRemove[ID(coin.ID)] = coinToRemove + 1
++			continue
++		}
++		coinsToRemove[ID(coin.ID)] = 1
++	}
++	return coinsToRemove
++}
++
+diff --git a/proto/pot/service.proto b/proto/pot/service.proto
+index ce31dfa..9fc8c01 100644
+--- a/proto/pot/service.proto
++++ b/proto/pot/service.proto
+@@ -36,7 +36,7 @@ message CreatePotRequest {
+     string pot_name = 1 [
+         (validator.field) = {
+             regex: "^[A-Za-z0-9]{2}(?:[ _-]?[A-Za-z0-9])+$"
+-            human_error: "Can contain only alphanumeric characters, dot and underscore."
++            human_error: "Can start with at least 2 alphanumeric characters following by blank space, underscore, dash or one or more alphanumeric characters."
+         }
+     ]; // required
+     int32 max_coins = 2 [(validator.field) = {int_gt:5}];
